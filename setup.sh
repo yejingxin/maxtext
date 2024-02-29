@@ -102,6 +102,7 @@ if [[ "$MODE" == "stable" || ! -v MODE ]]; then
         else
             echo "Installing stable jax, jaxlib, libtpu for tpu"
             pip3 install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+            pip3 install ipyparallel
         fi
 
         if [[ -n "$LIBTPU_GCS_PATH" ]]; then 
