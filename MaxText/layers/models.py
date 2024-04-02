@@ -69,6 +69,7 @@ class DecoderLayer(nn.Module):
     # inputs: embedded inputs to the decoder with shape [batch, length, emb_dim]
     lnx = RMSNorm(
         dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
         name='pre_self_attention_norm',
         epsilon=cfg.normalization_layer_epsilon,
         kernel_axes=('embed',))(inputs)
@@ -85,9 +86,11 @@ class DecoderLayer(nn.Module):
       attention_kernel=cfg.attention,
       mesh=mesh,
       dtype=cfg.dtype,
+      weight_dtype=cfg.weight_dtype,
       dropout_rate=cfg.dropout_rate,
       name='self_attention',
-      quant=self.quant)
+      quant=self.quant,
+      quantize_kvcache=self.quantize_kvcache)
 
 
     attention_lnx = attention_layer(
@@ -108,6 +111,7 @@ class DecoderLayer(nn.Module):
         activations=cfg.mlp_activations,
         intermediate_dropout_rate=cfg.dropout_rate,
         dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
         name='mlp',
         config=cfg,
         quant=self.quant,
@@ -163,9 +167,9 @@ class Decoder(nn.Module):
       # TODO(ranran): update to Mistral with sliding window attention
       from layers import mistral
       return mistral.MistralDecoderLayer
-    elif self.config.decoder_block == "gamma":
-      from layers import gamma
-      return gamma.GammaDecoderLayer
+    elif self.config.decoder_block == "gemma":
+      from layers import gemma
+      return gemma.GemmaDecoderLayer
     elif self.config.decoder_block == "gpt3":
       from layers import gpt3
       return gpt3.Gpt3DecoderLayer
@@ -173,7 +177,7 @@ class Decoder(nn.Module):
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
   def get_norm_layer(self):
-    if self.config.decoder_block in ("default", "llama2", "mistral", "gamma"):
+    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma"):
       return RMSNorm
     elif self.config.decoder_block == "gpt3":
       from layers import gpt3
@@ -217,10 +221,25 @@ class Decoder(nn.Module):
     if cfg.remat_policy != 'none':
       if cfg.remat_policy == 'minimal':
         policy = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
-      elif cfg.remat_policy == 'proj':
+      elif cfg.remat_policy == 'save_dot_except_mlpwi':
         policy = jax.checkpoint_policies.save_only_these_names(
-            'query_proj', 'value_proj', 'key_proj'
+            'query_proj', 'value_proj', 'key_proj', 'qkv_proj', 'out_proj', 'mlpwo',
         )
+      elif cfg.remat_policy == 'save_dot_except_mlp':
+        policy = jax.checkpoint_policies.save_only_these_names(
+            'query_proj', 'value_proj', 'key_proj', 'qkv_proj', 'out_proj',
+        )
+      elif cfg.remat_policy == 'save_qkv_proj':
+        policy = jax.checkpoint_policies.save_only_these_names(
+            'query_proj', 'value_proj', 'key_proj', 'qkv_proj',
+        )
+      elif cfg.remat_policy == 'qkv_proj_offloaded':
+        policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+          names_which_can_be_saved=[], 
+          names_which_can_be_offloaded=['query_proj', 'value_proj', 'key_proj'], 
+          offload_src="device", offload_dst="pinned_host")
+      elif cfg.remat_policy == 'minimal_offloaded':
+        policy = jax.checkpoint_policies.offload_dot_with_no_batch_dims(offload_src="device", offload_dst="pinned_host")
       else:
         assert (
             cfg.remat_policy == 'full'
@@ -244,6 +263,7 @@ class Decoder(nn.Module):
               'params': params_spec,
               'cache': cache_spec,
               'intermediates': 0,
+              'aqt':0,
           },
           split_rngs={
               'params': True,
@@ -277,6 +297,7 @@ class Decoder(nn.Module):
 
     y = self.get_norm_layer()(
       dtype=cfg.dtype,
+      weight_dtype=cfg.weight_dtype,
       name='decoder_norm',
       epsilon=cfg.normalization_layer_epsilon,
       kernel_axes=('embed',),
@@ -295,21 +316,23 @@ class Decoder(nn.Module):
     else:
       logits = linears.DenseGeneral(
           cfg.vocab_size,
+          weight_dtype=cfg.weight_dtype,
           dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
           kernel_axes=('embed', 'vocab'),
-          name='logits_dense',
-          quant=self.quant)(y) # We do not quantize the logits matmul.
+          name='logits_dense')(y) # We do not quantize the logits matmul.
     logits = nn.with_logical_constraint(
         logits, ('activation_batch', 'activation_length', 'activation_vocab'))
+    logits = logits.astype(jnp.float32)
     return logits
 
 
 class Transformer(nn.Module):
   """An decoder-only Transformer model."""
+  # Make new attributes required, so that all Transformer dependencies (train, decode, compile, etc) will error instead of silently use defaults.
   # pylint: disable=attribute-defined-outside-init
   config: Config
   mesh: Mesh
-  quant: Optional[Quant] = None
+  quant: Quant
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""

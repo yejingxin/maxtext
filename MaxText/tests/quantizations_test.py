@@ -59,6 +59,12 @@ def _apply(quant_str=""):
 class QuantizationTest(unittest.TestCase):
   """Tests for quantization."""
 
+  def test_in_quant_mode(self):
+    quant = _configure_quantization(quant_str="int8", mode_str='convert')
+    self.assertTrue(quantizations.in_convert_mode(quant))
+    self.assertFalse(quantizations.in_serve_mode(quant))
+
+
   def test_configure_quantization_is_null(self):
     for quant_mode in ["train", "serve", "convert"]:
       quant = _configure_quantization(quant_str="", mode_str=quant_mode)
@@ -68,7 +74,6 @@ class QuantizationTest(unittest.TestCase):
     for quant_mode in ["train", "serve", "convert"]:
       quant = _configure_quantization(quant_str="int8", mode_str=quant_mode)
       self.assertNotEqual(quant, None)
-      self.assertEqual(quant.quant_dg, quantizations.AQT_INT8_CONFIG)
 
   def test_aqt_quantization(self):
     # Without quantization
@@ -84,6 +89,36 @@ class QuantizationTest(unittest.TestCase):
     self.assertEqual(res_einsum.dtype, np.dtype(np.float32))
     self.assertTrue(jnp.greater(jnp.max(inputs), jnp.max(res_dg[0][0])))
     #self.assertEqual(res_dg.dtype, np.dtype(np.float32))
+
+  def test_remove_quantized_params(self):
+    _params = {
+      'decoder': {
+        'decoder_norm': {'scale': 1.0},
+        'layers': {
+          'mlp': {'wi_0': {'kernel': 1.0}, 'wi_1': {'kernel': 1.0}, 'wo': {'kernel': 1.0}},
+          'self_attention': {'key': {'kernel': 1.0},}},
+        'logits_dense': {'kernel': 1.0}},
+      }
+    _aqt_vars = {
+      'decoder': {
+        'layers': {
+          'mlp': {
+            'wi_0': {'AqtDotGeneral_0': {'qrhs': {'scale': 1.0, '_value': 1.0 }}},
+            'wi_1': {'AqtDotGeneral_0': {'qrhs': {'scale': 1.0, '_value': 1.0 }}},
+            'wo': {'AqtDotGeneral_0': {'qrhs': {'scale': 1.0, '_value': 1.0 }}}
+            },
+          'self_attention': {'key': {'AqtDotGeneral_0': {'qrhs': {'scale': 1.0, '_value': 1.0}},}}}}
+      }
+    _expected = {
+      'decoder': {
+        'decoder_norm': {'scale': 1.0},
+        'layers': {
+          'mlp': {'wi_0': {'kernel': {}}, 'wi_1': {'kernel': {}}, 'wo': {'kernel': {}}},
+          'self_attention': {'key': {'kernel': {}},}},
+        'logits_dense': {'kernel': 1.0},}
+      }
+    result = quantizations.remove_quantized_params(_params, _aqt_vars)
+    self.assertEqual(_expected, result)
 
 if __name__ == '__main__':
   unittest.main()

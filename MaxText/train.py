@@ -29,9 +29,11 @@ from typing import Sequence
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+import grain.python as grain
 import jax
 import numpy as np
 import optax
+import orbax.checkpoint
 
 import checkpointing
 import max_utils
@@ -39,6 +41,8 @@ import maxtext_utils
 import max_logging
 import optimizers
 import pyconfig
+# pylint: disable-next=unused-import
+import register_jax_proxy_backend
 
 from input_pipeline.input_pipeline_interface import create_data_iterator_with_tokenizer
 from layers import models
@@ -46,8 +50,6 @@ from layers import models
 import jax.numpy as jnp
 from jax import random
 from jax.sharding import Mesh
-
-from jax.experimental.compilation_cache import compilation_cache as cc
 
 from cloud_tpu_diagnostics import diagnostic
 from cloud_tpu_diagnostics.configuration import debug_configuration
@@ -69,19 +71,7 @@ def validate_train_config(config):
     max_logging.log("WARNING: 'base_output_directory' might be pointing your local file system")
   assert config.steps > 0, "You must set steps or learning_rate_schedule_steps to a positive interger."
 
-# https://arxiv.org/pdf/2204.02311.pdf Appendix B
-def calculate_training_tflops(num_model_parameters, config):
-  """ Calculate training TFLOP"""
-  learnable_weight_tflops = 6 * num_model_parameters * config.max_target_length * config.per_device_batch_size \
-                                   / 10**12
-  noncasual_attention_flops = 12 * config.num_query_heads * config.num_decoder_layers * config.head_dim \
-                      * config.max_target_length**2 * config.per_device_batch_size / 10**12
-  causal_attention_tflops = noncasual_attention_flops / 2 # due to causality in attention
-  total_tflops = learnable_weight_tflops + causal_attention_tflops
-  print(f'Per train step, total TFLOPs will be {total_tflops:.2f},',
-        f'split as {100 * learnable_weight_tflops/total_tflops:.2f}% learnable weight flops',
-        f'and {100 * causal_attention_tflops/total_tflops:.2f}% attention flops')
-  return total_tflops
+
 
 def get_first_step(state):
   with jax.spmd_mode('allow_all'):
@@ -158,6 +148,23 @@ def write_metrics_to_tensorboard(writer, metrics, step, config):
           f"To see full metrics 'tensorboard --logdir={config.tensorboard_dir}'"
       )
       writer.flush()
+
+def save_checkpoint(checkpoint_manager, step, state, dataset_type='c4', data_iterator=None):
+  """Wrapper for saving checkpoint"""
+  if dataset_type == 'c4-array_record':
+    return checkpoint_manager.save(
+      step,
+      args=orbax.checkpoint.args.Composite(
+        items=orbax.checkpoint.args.PyTreeSave(item=state),
+        iter=grain.PyGrainCheckpointSave(data_iterator.local_iterator)
+        )
+      )
+  else:
+    return checkpoint_manager.save(
+      step,
+      args=orbax.checkpoint.args.Composite(
+        items=orbax.checkpoint.args.PyTreeSave(item=state)
+        ))
 
 # -----------------------------------------------------------------------------
 # Top-level Functions
@@ -297,6 +304,7 @@ def setup_mesh_and_model(config):
       config.enable_checkpointing,
       config.async_checkpointing,
       config.checkpoint_period,
+      config.dataset_type,
   )
   # Mesh definition
   devices_array = max_utils.create_device_mesh(config)
@@ -331,7 +339,7 @@ def setup_train_loop(config):
   init_rng, writer, checkpoint_manager, mesh, model, learning_rate_schedule, tx = setup_mesh_and_model(config)
   data_iterator, eval_data_iterator, _ = create_data_iterator_with_tokenizer(config, mesh)
 
-  state, state_mesh_annotations = max_utils.setup_training_state(model,
+  state, state_mesh_annotations, data_iterator = max_utils.setup_training_state(model, data_iterator,
           tx, config, init_rng, mesh, checkpoint_manager)
 
   return ( init_rng, writer, checkpoint_manager, state_mesh_annotations, model,
@@ -369,8 +377,8 @@ def train_loop(config, state=None):
 
 
   num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
-  max_logging.log(f"number parameters: {num_model_parameters/10**9:.3f} billion")
-  per_device_tflops = calculate_training_tflops(num_model_parameters, config)
+  max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
+  per_device_tflops, _, _ = maxtext_utils.calculate_tflops_training_per_device(num_model_parameters, config)
 
   # Write train config params, num model params, and XLA flags to tensorboard
   max_utils.add_text_to_summary_writer("num_model_parameters", str(num_model_parameters), writer)
@@ -415,20 +423,22 @@ def train_loop(config, state=None):
     if step == first_profiling_step:
       max_utils.activate_profiler(config)
 
-    example_batch = load_next_batch(data_iterator, example_batch, config)
-    nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      state, metrics = p_train_step(
-          state, example_batch, nextrng
-      )
+    with jax.profiler.StepTraceAnnotation("train", step_num=step):
+      example_batch = load_next_batch(data_iterator, example_batch, config)
+      nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        state, metrics = p_train_step(
+            state, example_batch, nextrng
+        )
 
     new_time = datetime.datetime.now()
     record_scalar_metrics(metrics, new_time - last_step_completion,  per_device_tflops, learning_rate_schedule(step))
     last_step_completion = new_time
 
     if checkpoint_manager is not None:
-      if checkpoint_manager.save(step, state):
+      if save_checkpoint(checkpoint_manager, step, state, config.dataset_type, data_iterator):
         max_logging.log(f"saved a checkpoint at step {step}")
+
       # Upon preemption, exit when and only when all ongoing saves are complete.
       if checkpoint_manager.reached_preemption(step):
         checkpoint_manager.wait_until_finished()
@@ -456,6 +466,8 @@ def train_loop(config, state=None):
     if step == last_profiling_step:
       max_utils.deactivate_profiler(config)
 
+  if checkpoint_manager is not None:
+    checkpoint_manager.wait_until_finished()
   write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config) # final step metrics
   max_utils.close_summary_writer(writer)
   return state
@@ -467,10 +479,6 @@ def main(argv: Sequence[str]) -> None:
   pyconfig.initialize(argv)
   config = pyconfig.config
   validate_train_config(config)
-  if jax.__version__ <= '0.4.23':
-    cc.initialize_cache(os.path.expanduser(config.jax_cache_dir))
-  else:
-    cc.set_cache_dir(os.path.expanduser(config.jax_cache_dir))
   os.environ["TFDS_DATA_DIR"] = config.dataset_path
   debug_config = debug_configuration.DebugConfig(
     stack_trace_config = stack_trace_configuration.StackTraceConfig(

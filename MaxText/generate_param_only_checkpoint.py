@@ -23,8 +23,6 @@
    The output "parameter state" is output to the checkpoint directory. Additionally it is cast down to bf16.
 """
 
-import sys
-
 import checkpointing
 import jax
 import max_logging
@@ -37,7 +35,8 @@ from etils import epath
 from jax.sharding import Mesh
 from jax import random
 from typing import Sequence
-from layers import models
+from layers import models, quantizations
+from train import save_checkpoint
 
 Transformer = models.Transformer
 
@@ -74,15 +73,16 @@ def _possibly_unroll_params(config, training_state, training_state_annotations, 
 def _read_train_checkpoint(config, checkpoint_manager, mesh):
   """Read training checkpoint at path defined by load_full_state_path."""
   # Model and Optimizer definition
-  model = Transformer(config, mesh)
+  quant = quantizations.configure_quantization(config)
+  model = Transformer(config, mesh, quant)
   rng = random.PRNGKey(0)
   learning_rate_schedule = max_utils.create_learning_rate_schedule(config)
   tx = optimizers.get_optimizer(config, learning_rate_schedule)
-  state, state_mesh_notations = max_utils.setup_training_state(
-    model, tx, config, rng, mesh, checkpoint_manager
+  state, state_mesh_notations, _ = max_utils.setup_training_state(
+    model, None, tx, config, rng, mesh, checkpoint_manager
   )
   num_params = max_utils.calculate_num_params_from_pytree(state.params)
-  max_logging.log(f"In input checkpoint Number of model params={num_params/10**9:.3f} billion")
+  max_logging.log(f"In input checkpoint Number of model params={num_params/1e9:.3f} billion")
   return state, state_mesh_notations
 
 def _save_decode_checkpoint(config, state, checkpoint_manager):
@@ -90,12 +90,9 @@ def _save_decode_checkpoint(config, state, checkpoint_manager):
   with jax.spmd_mode('allow_all'):
     decode_state = max_utils.init_decode_state(None, jax.tree_map(lambda x : x.astype(jax.numpy.bfloat16), state.params))
   if checkpoint_manager is not None:
-    if checkpoint_manager.save(0, decode_state):
+    if save_checkpoint(checkpoint_manager, 0, decode_state):
       max_logging.log(f"saved an decode checkpoint at {config.checkpoint_dir}")
-    # Upon preemption, exit when and only when all ongoing saves are complete.
-    if checkpoint_manager.reached_preemption(0):
-      checkpoint_manager.wait_until_finished()
-      sys.exit()
+  checkpoint_manager.wait_until_finished()
 
 def generate_decode_checkpoint(config):
   """
@@ -114,9 +111,6 @@ def generate_decode_checkpoint(config):
     if jax.process_index() == 0:
       path.rmtree()
 
-  assert config.load_full_state_path, "load_full_state_path not configured"
-  assert epath.Path(config.load_full_state_path).exists(), f"no checkpoint at {config.load_full_state_path=}"
-
   # Create a checkpoint manager to save decode checkpoint at config.checkpoint_dir
   checkpoint_manager = checkpointing.create_orbax_checkpoint_manager(
       config.checkpoint_dir,
@@ -134,7 +128,7 @@ def generate_decode_checkpoint(config):
   # Save decode state to config's checkpoint directory at step 0
   max_logging.log(f"Save decode checkpoint at: {config.checkpoint_dir}")
   _save_decode_checkpoint(config, training_state, checkpoint_manager)
-  max_logging.log(f"Successfully generated decode checkpoint at: {config.checkpoint_dir}0/default")
+  max_logging.log(f"Successfully generated decode checkpoint at: {config.checkpoint_dir}0/items")
   return True
 
 

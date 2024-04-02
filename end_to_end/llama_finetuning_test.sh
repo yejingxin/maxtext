@@ -1,7 +1,13 @@
+#!/bin/bash
+
+# This script is designed for internal use within Google. External users can adapt it by:
+#  - Updating GCS paths (gs://) to your accessible locations.
+#  - Using the checkpoint generated from train.py or available one in open source (https://llama.meta.com/llama-downloads/).
+
 set -e
 idx=$(date +%Y-%m-%d-%H-%M)
 
-base_ckpt_path=gs://maxtext-llama/test/2024-01-15-06-49/decode-ckpt-maxtext/0/default
+base_ckpt_path=gs://maxtext-llama/test/2024-01-15-06-49/decode-ckpt-maxtext/0/items
 BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs
 DATASET_PATH=gs://maxtext-dataset
 
